@@ -1,0 +1,4 @@
+interface:
+  display_name: "SRT 本地音色讲解视频"
+  short_description: "把 transcription.srt 做成本地音色配音的 9:16 竖屏讲解成片，含响度母带与 30 项质检"
+  default_prompt: "使用 $srt-voice-explainer 把当前项目的 transcription.srt 做成 1080×1920 竖屏讲解视频，用本地 my_voice 音色配音，并跑完质检与交付。"
