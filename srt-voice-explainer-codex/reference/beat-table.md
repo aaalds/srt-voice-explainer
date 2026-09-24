@@ -91,10 +91,36 @@ video_work/micro_script.json   自动编号 + 自动估时长
 }
 ```
 
+连字符词、品牌后缀、型号前后缀或其他组合词还要声明组成关系。例：
+
+```json
+{
+  "surface": "Zeva-Ego",
+  "normalized": "zeva-ego",
+  "canonical_tts": "ZeevaEgo",
+  "source": "component pronunciations verified separately",
+  "occurrences": ["b008", "b026", "b038"],
+  "verified": true,
+  "high_risk": true,
+  "components": [
+    {"normalized": "zeva", "compound_tts": "Zeeva"},
+    {"normalized": "ego", "compound_tts": "Ego"}
+  ],
+  "continuity": {"required": true, "max_gap_ms": 80}
+}
+```
+
+`components` 的顺序就是口播顺序。`compound_tts` 可以采用不同正字法，但必须与该组成词已确认的
+音素和重音一致；不能为了“连读”把组成词换成另一种近似音。`continuity` 只约束词间静音，
+不授权改变读法。用户点名纠过的词、标题或开场高曝光专名标记 `high_risk:true`。
+
 - `normalized` 相同的所有出现位置必须使用完全相同的 `canonical_tts`，不得按章节或上下文临时改写。
 - 大小写、单复数或连字符变化若读音相同，应归并到同一个规范项；确实不同才拆项并说明理由。
-- 英文单词、缩写、品牌名、产品名、模型名和技术术语必须全量入表；重复词必须列出全部 beat id。
+- 英文单词、缩写、品牌名、产品名、模型名、技术术语和旁白会读到的数学标识符必须全量入表；
+  重复项必须列出全部 beat id。
 - 生成后按条目串联试听全部出现位置；ASR 文本相同不等于读音一致，仍要核对音素和重音。
+- 组合词至少试听一次“独立组成词 → 组合词”的 A/B 序列；逐词时间戳只证明边界和停顿，
+  不证明音素完全正确。人工确认结果写入 `PRONUNCIATION_QA.json`。
 - 任一重复词前后读法不同 → FAIL；先更新全局台账，再只重生成受影响的单元。
 
 常用读法规则：
@@ -104,6 +130,7 @@ video_work/micro_script.json   自动编号 + 自动估时长
 | 英文缩写 | 按字母读，字母间加空格 | `MHA` → `M H A`；`KV Cache` → `K V Cache` |
 | 年份 | 逐位读 | `2017年` → `二零一七年` |
 | 数学符号 | 读成中文 | `O(n²)` → `O n 平方`；`n×n` → `n 乘 n` |
+| 数学标识符 | 按用户偏好/领域习惯固定朗读形式，不把排版符号直接送给 TTS | `x_t` → `xt` 或 `x 下标 t`，全片只能选一种 |
 | 大数 | 读成中文 | `128K到1M` → `十二万八千到一百万` |
 | 百分数/倍数 | 读成中文 | `25%` → `百分之二十五` |
 | 希腊字母 | 中文 TTS 没有稳定读法 → 换成语义词，符号只出现在画面上 | `φ` → `函数` |

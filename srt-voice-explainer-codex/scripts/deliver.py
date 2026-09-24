@@ -22,6 +22,7 @@ from vconfig import CFG  # noqa: E402
 ROOT, WORK, PROJECT, DELIVER = CFG.root, CFG.work, CFG.project, CFG.deliver
 FFPROBE = CFG.ffprobe()
 RUNTIME = CFG.runtime
+LOUD = CFG.loudness
 
 
 def sha256(path: Path) -> str:
@@ -48,6 +49,28 @@ def probe(path: Path) -> dict:
     return json.loads(out)
 
 
+def command_output(cmd: list[str], fallback: str = "unknown") -> str:
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return fallback
+    text = (proc.stdout or proc.stderr).strip()
+    return text.splitlines()[0] if proc.returncode == 0 and text else fallback
+
+
+def local_hyperframes_version() -> str:
+    for base in (PROJECT, ROOT):
+        package = base / "node_modules" / "hyperframes" / "package.json"
+        if package.exists():
+            try:
+                return json.loads(package.read_text(encoding="utf-8"))["version"]
+            except (KeyError, OSError, json.JSONDecodeError):
+                pass
+    return "unknown; use the project lockfile or recorded CLI output"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("video", type=Path)
@@ -55,6 +78,36 @@ def main() -> None:
     DELIVER.mkdir(parents=True, exist_ok=True)
     v = next_version()
     tag = f"v{v:02d}"
+
+    metrics_path = DELIVER / "qa_metrics.json"
+    if not metrics_path.exists():
+        raise SystemExit("qa_metrics.json missing; run qa_video.py before deliver.py")
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    if int(metrics.get("fail_count", 1)) != 0:
+        raise SystemExit(
+            f"QA still has {metrics.get('fail_count')} failure(s); delivery is blocked"
+        )
+
+    required_reports = [
+        WORK / "PRONUNCIATION_LEDGER.json",
+        WORK / "PRONUNCIATION_QA.json",
+        WORK / "VISUAL_STABILITY_REPORT.json",
+        WORK / "STYLE_AUDIT.md",
+        WORK / "QA_REPORT.md",
+        DELIVER / "contact_sheet.png",
+    ]
+    if CFG.technical_explainer:
+        required_reports += [
+            WORK / "TECHNICAL_EXPLAINER_AUDIT.md",
+            WORK / "TIMESTAMP_AUDIT.md",
+        ]
+    optional_reports = [
+        WORK / "BGM_PROVENANCE.md",
+        WORK / "AUDIO_PATCH_REPORT.json",
+    ]
+    missing_reports = [str(path) for path in required_reports if not path.exists()]
+    if missing_reports:
+        raise SystemExit("required delivery reports missing:\n  " + "\n  ".join(missing_reports))
 
     align = json.loads((WORK / "alignment.json").read_text(encoding="utf-8"))
     copies = [
@@ -71,7 +124,24 @@ def main() -> None:
         (WORK / "alignment.json", f"alignment_{tag}.json"),
         (WORK / "narration" / "qa-asr.json", f"qa_asr_{tag}.json"),
         (WORK / "narration" / "mastering_report.json", f"mastering_report_{tag}.json"),
+        (WORK / "PRONUNCIATION_LEDGER.json", f"PRONUNCIATION_LEDGER_{tag}.json"),
+        (WORK / "PRONUNCIATION_QA.json", f"PRONUNCIATION_QA_{tag}.json"),
+        (WORK / "VISUAL_STABILITY_REPORT.json", f"VISUAL_STABILITY_REPORT_{tag}.json"),
+        (WORK / "STYLE_AUDIT.md", f"STYLE_AUDIT_{tag}.md"),
+        (WORK / "QA_REPORT.md", f"QA_REPORT_{tag}.md"),
+        (DELIVER / "qa_metrics.json", f"qa_metrics_{tag}.json"),
+        (DELIVER / "contact_sheet.png", f"contact_sheet_{tag}.png"),
+        (DELIVER / "transitions_sheet.png", f"transitions_sheet_{tag}.png"),
     ]
+    copies += [
+        (path, f"{path.stem}_{tag}{path.suffix}")
+        for path in optional_reports if path.exists()
+    ]
+    if CFG.technical_explainer:
+        copies += [
+            (WORK / "TECHNICAL_EXPLAINER_AUDIT.md", f"TECHNICAL_EXPLAINER_AUDIT_{tag}.md"),
+            (WORK / "TIMESTAMP_AUDIT.md", f"TIMESTAMP_AUDIT_{tag}.md"),
+        ]
     written = []
     for src, name in copies:
         if not src.exists():
@@ -84,15 +154,17 @@ def main() -> None:
     info = probe(args.video)
     vs = next(s for s in info["streams"] if s["codec_type"] == "video")
     as_ = next((s for s in info["streams"] if s["codec_type"] == "audio"), None)
-    metrics_path = DELIVER / "qa_metrics.json"
-    metrics = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else {}
-
     fonts = sorted((PROJECT / "assets" / "fonts").glob("*"))
+    audit_hashes = {
+        path.name: sha256(path)
+        for path in required_reports + optional_reports if path.exists()
+    }
     manifest = {
         "project": CFG["project"],
         "version": tag,
         "generated_from": f"skill:srt-voice-explainer + {CFG['srt']}",
         "timing_mode": "QUALITY_FIRST",
+        "technical_explainer": CFG.technical_explainer,
         "inputs": {
             CFG["srt"]: sha256(CFG.srt),
             "video.config.json": sha256(ROOT / "video.config.json"),
@@ -108,14 +180,13 @@ def main() -> None:
             "reference_sha256": align["reference_sha256"],
             "reference_text_sha256": align["reference_text_sha256"],
             "cloud_upload": False,
-            "pauses_s": {"clause": 0.14, "sentence": 0.32, "chapter": 0.60,
-                         "lead_in": align["lead_in"], "tail": align["tail"]},
+            "pauses_s": dict(CFG.pauses),
             "mastering": "per unit: highpass 75Hz -> BS.1770-4 gated measurement "
-                         "(tools/loudness.py) -> linear gain to -17 LUFS -> look-ahead "
-                         "true-peak limiter at -1.6 dBFS; programme: concat -> single "
-                         "linear gain to -17 LUFS -> limiter at -1.4 dBFS -> 48kHz mono PCM24. "
-                         "ffmpeg loudnorm is deliberately not used: it is invalid below 3s "
-                         "of input and 15 of the 86 units are shorter than that.",
+                         f"(scripts/loudness.py) -> linear gain to {LOUD['unit_target_lufs']} LUFS "
+                         f"-> limiter at {LOUD['unit_ceiling_dbfs']} dBFS; programme -> "
+                         f"{LOUD['programme_target_lufs']} LUFS -> limiter at "
+                         f"{LOUD['programme_ceiling_dbfs']} dBFS. See mastering_report for "
+                         "the actual unit count and measured distribution.",
             "loudness_consistency_targets": CFG.loudness,
         },
         "asr_verification": {
@@ -123,22 +194,19 @@ def main() -> None:
             "metric": "character Levenshtein on normalised text",
         },
         "fonts": [f.name for f in fonts],
-        "animation_runtime": "GSAP 3.14.2 (vendored, offline)",
-        "audio_master_step": (
-            "renderer applies ~+3.1 dB to the embedded track; the delivered file "
-            "re-muxes the -17 LUFS narration master with -c:v copy (picture untouched)"
-        ),
+        "audit_files": audit_hashes,
+        "animation_runtime": "recorded by the HyperFrames project and lockfile",
+        "audio_master_step": "See mastering_report and reproduce commands for the actual remux path.",
         "toolchain": {
-            "hyperframes": "0.7.76 (offline npx cache)",
-            "node": subprocess.run(
-                ["node", "-v"], capture_output=True, text=True, timeout=30
-            ).stdout.strip(),
-            "ffmpeg": subprocess.run([shutil.which("ffmpeg") or "ffmpeg", "-version"],
-                                     capture_output=True, text=True,
-                                     timeout=30).stdout.split("\n")[0],
+            "hyperframes": local_hyperframes_version(),
+            "node": command_output(["node", "-v"]),
+            "ffmpeg": command_output([shutil.which("ffmpeg") or "ffmpeg", "-version"]),
             "python": platform.python_version(),
             "os": f"{platform.system()} {platform.release()}",
-            "gpu": "NVIDIA GeForce RTX 3060 Ti (CUDA 12.8)",
+            "gpu": command_output(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                fallback="not detected",
+            ),
         },
         "output": {
             "file": f"final_video_{tag}.mp4",
@@ -167,20 +235,18 @@ def main() -> None:
         },
         "source_project": f"{CFG['work_dir']}/{CFG['project']} (index.html + compositions/*.html)",
         "reproduce": [
-            "./.qwen-tts-venv/Scripts/python.exe tools/build_micro_script.py",
-            "./.qwen-tts-venv/Scripts/python.exe generate_tts.py",
-            "./.qwen-tts-venv/Scripts/python.exe generate_tts.py --remaster   "
-            "# 只重跑母带（不动模型/原始录音），用于响度一致性修复",
-            "./.qwen-tts-venv/Scripts/python.exe tools/sync_timing.py",
-            "./.qwen-tts-venv/Scripts/python.exe tools/build_docs.py",
-            "tools/hf.sh check   (in video_work/attention-9x16)",
-            "tools/hf.sh render -q high --crf 18 -o renders/final.mp4",
-            "ffmpeg -i renders/final.mp4 -i video_work/narration/narration.wav "
-            "-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -ar 48000 -ac 1 "
-            "-shortest -movflags +faststart renders/final-mastered.mp4   "
-            "# 渲染器给音轨加了约 +3 dB；用母带 wav 重挂音轨把成片拉回 -17 LUFS",
-            "./.qwen-tts-venv/Scripts/python.exe tools/qa_video.py <video>",
-            "./.qwen-tts-venv/Scripts/python.exe tools/deliver.py <video>",
+            "python <skill>/scripts/run_project.py build_micro_script.py && "
+            "python <skill>/scripts/run_project.py check_verbatim.py",
+            "python <skill>/scripts/run_project.py generate_tts.py",
+            "python <skill>/scripts/run_project.py generate_tts.py --remaster",
+            "python <skill>/scripts/run_project.py sync_timing.py",
+            "python <skill>/scripts/run_project.py build_docs.py",
+            f"<skill>/scripts/hf.sh check   (in {CFG['work_dir']}/{CFG['project']})",
+            "<skill>/scripts/hf.sh render <project-specific render arguments>",
+            "ffmpeg -i <rendered-video> -i <narration.wav> -c:v copy "
+            "<project-specific AAC/remux arguments> <final-video>",
+            "python <skill>/scripts/run_project.py qa_video.py <final-video>",
+            "python <skill>/scripts/run_project.py deliver.py <final-video>",
         ],
     }
     (DELIVER / "manifest.json").write_text(

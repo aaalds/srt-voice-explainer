@@ -21,6 +21,7 @@ CONFIG_NAME = "video.config.json"
 
 DEFAULTS = {
     "project": "explainer-9x16",
+    "technical_explainer": False,       # True -> require formula/code content audits
     "srt": "transcription.srt",
     "voice_dir": "my_voice",
     "work_dir": "video_work",
@@ -107,6 +108,7 @@ class Config:
         self.work = root / self.data["work_dir"]
         self.deliver = root / self.data["deliver_dir"]
         self.project = self.work / self.data["project"]
+        self.technical_explainer = bool(self.data["technical_explainer"])
         self.compositions = self.project / "compositions"
         self.assets = self.project / "assets"
         self.renders = self.project / "renders"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -60,6 +61,114 @@ def probe(path: Path) -> dict:
 def check(name: str, ok: bool, measured, expected) -> dict:
     return {"check": name, "status": "PASS" if ok else "FAIL",
             "measured": measured, "expected": expected}
+
+
+def markdown_audit_pass(path: Path) -> tuple[bool, str]:
+    """Require an explicit machine-readable PASS line in a manual audit.
+
+    The report remains human-readable Markdown, but must contain `status: PASS`
+    on its own line. Merely creating an empty file cannot satisfy the gate.
+    """
+    if not path.exists():
+        return False, f"missing {path.name}"
+    text = path.read_text(encoding="utf-8")
+    passed = bool(re.search(r"(?im)^\s*(?:status|overall)\s*:\s*PASS\s*$", text))
+    return passed, f"{path.name}: {'PASS' if passed else 'missing explicit status: PASS'}"
+
+
+def pronunciation_ledger_pass(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, f"missing {path.name}"
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"invalid JSON: {exc}"
+    if not isinstance(entries, list) or not entries:
+        return False, "ledger must be a non-empty JSON list"
+    required = {"surface", "normalized", "canonical_tts", "source", "occurrences", "verified"}
+    bad = [i for i, item in enumerate(entries)
+           if not isinstance(item, dict) or not required.issubset(item) or item.get("verified") is not True]
+    return not bad, f"{len(entries)} entries; invalid/unverified={bad[:8]}"
+
+
+def pronunciation_qa_pass(path: Path) -> tuple[bool, str]:
+    """Validate the blocking, evidence-bearing pronunciation review report."""
+    if not path.exists():
+        return False, f"missing {path.name}"
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"invalid JSON: {exc}"
+    if not isinstance(report, dict) or str(report.get("status", "")).upper() != "PASS":
+        return False, "report status must be PASS"
+    checks = report.get("checks")
+    if not isinstance(checks, list) or not checks:
+        return False, "checks must be a non-empty list"
+    problems = []
+    occurrence_count = 0
+    for index, item in enumerate(checks):
+        if not isinstance(item, dict) or not str(item.get("term", "")).strip():
+            problems.append(f"check[{index}] missing term")
+            continue
+        occurrences = item.get("occurrences")
+        if not isinstance(occurrences, list) or not occurrences:
+            problems.append(f"{item.get('term')}: no occurrences")
+            continue
+        occurrence_count += len(occurrences)
+        for occurrence in occurrences:
+            if (not isinstance(occurrence, dict)
+                    or not str(occurrence.get("beat", "")).strip()
+                    or str(occurrence.get("result", "")).upper() != "PASS"
+                    or not str(occurrence.get("evidence", "")).strip()):
+                problems.append(f"{item.get('term')}: invalid occurrence evidence")
+                break
+        if item.get("components"):
+            if item.get("component_pronunciations_match") is not True:
+                problems.append(f"{item.get('term')}: component pronunciations do not match")
+        if item.get("continuity_required") is True:
+            try:
+                gap = float(item["max_gap_ms"])
+                allowed = float(item.get("allowed_gap_ms", 80))
+                if gap < 0 or gap > allowed:
+                    problems.append(f"{item.get('term')}: gap {gap}ms exceeds {allowed}ms")
+            except (KeyError, TypeError, ValueError):
+                problems.append(f"{item.get('term')}: invalid max_gap_ms/allowed_gap_ms")
+    return not problems, (
+        f"{len(checks)} checks / {occurrence_count} occurrences; problems={problems[:6]}"
+    )
+
+
+def intentional_freezes_pass(freezes: list[dict], path: Path) -> tuple[bool, str]:
+    if not freezes:
+        return True, "0 segments"
+    if not path.exists():
+        return False, f"{len(freezes)} segments; missing {path.name}"
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"invalid {path.name}: {exc}"
+    holds = report.get("intentional_holds", []) if isinstance(report, dict) else []
+
+    def covers(hold: object, freeze: dict) -> bool:
+        if not isinstance(hold, dict) or hold.get("reviewed") is not True:
+            return False
+        if not str(hold.get("reason", "")).strip():
+            return False
+        try:
+            return (float(hold["start"]) <= freeze["start"] + 0.25
+                    and float(hold["end"]) >= freeze["end"] - 0.25)
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    uncovered = []
+    for freeze in freezes:
+        covered = any(covers(hold, freeze) for hold in holds)
+        if not covered:
+            uncovered.append(freeze)
+    status_ok = str(report.get("status", "")).upper() == "PASS"
+    return status_ok and not uncovered, (
+        f"{len(freezes)} detected; {len(uncovered)} uncovered; report_status={report.get('status')}"
+    )
 
 
 def loudness_consistency(video: Path, align: dict) -> dict:
@@ -161,10 +270,21 @@ def main() -> None:
     blacks = re.findall(r"black_start:([\d.]+) black_end:([\d.]+)", bd)
     fd = run([FFMPEG, "-hide_banner", "-nostats", "-i", str(video),
               "-vf", "freezedetect=n=-58dB:d=4", "-an", "-f", "null", "-"]).stderr
-    freezes = re.findall(r"freeze_start: ([\d.]+)", fd)
+    freeze_starts = [float(x) for x in re.findall(r"freeze_start:\s*([\d.]+)", fd)]
+    freeze_ends = [float(x) for x in re.findall(r"freeze_end:\s*([\d.]+)", fd)]
+    if len(freeze_ends) < len(freeze_starts):
+        freeze_ends.extend([vdur] * (len(freeze_starts) - len(freeze_ends)))
+    freezes = [
+        {"start": start, "end": end, "duration": round(end - start, 3)}
+        for start, end in zip(freeze_starts, freeze_ends)
+    ]
+    freeze_ok, freeze_measured = intentional_freezes_pass(
+        freezes, WORK / "VISUAL_STABILITY_REPORT.json"
+    )
     results += [
         check("无黑帧段(≥0.2s)", len(blacks) == 0, f"{len(blacks)} 段 {blacks[:3]}", "0"),
-        check("无静止画面(≥4s)", len(freezes) == 0, f"{len(freezes)} 段 {freezes[:5]}", "0"),
+        check("≥4s 静止段均为已审计的有意停留", freeze_ok, freeze_measured,
+              "0 段，或 VISUAL_STABILITY_REPORT.json 逐段覆盖并 PASS"),
     ]
 
     # ---------------- C. audio ----------------
@@ -187,9 +307,15 @@ def main() -> None:
     silences = re.findall(r"silence_start: ([\d.]+)[\s\S]*?silence_duration: ([\d.]+)", sil)
     long_sil = [(float(s), float(d)) for s, d in silences if float(d) > 1.6 and float(s) < align["total_duration"] - 1.5]
 
+    programme_lo = LOUD["programme_target_lufs"] - 1.0
+    programme_hi = LOUD["programme_target_lufs"] + 1.0
     results += [
-        check("综合响度 −18~−15 LUFS", -18.5 <= lufs <= -15.0, f"{lufs:.2f} LUFS", "−18 ~ −15 LUFS"),
-        check("真峰值 ≤ −1 dBTP", tp <= -1.0, f"{tp:.2f} dBFS", "≤ −1.0"),
+        check(f"综合响度 {programme_lo:.0f}~{programme_hi:.0f} LUFS",
+              programme_lo <= lufs <= programme_hi, f"{lufs:.2f} LUFS",
+              f"{programme_lo:.0f} ~ {programme_hi:.0f} LUFS"),
+        check(f"真峰值 ≤ {LOUD['true_peak_max_dbtp']:.1f} dBTP",
+              tp <= LOUD["true_peak_max_dbtp"], f"{tp:.2f} dBFS",
+              f"≤ {LOUD['true_peak_max_dbtp']:.1f}"),
         check("无削波", tp < 0.0 and int(peak_count.group(1) if peak_count else 0) < 20,
               f"peak_count={peak_count.group(1) if peak_count else 'n/a'}", "无 0 dBFS 峰值堆积"),
         check("DC 偏移 < 0.01", abs(float(dc.group(1))) < 0.01 if dc else False,
@@ -248,9 +374,6 @@ def main() -> None:
               f"最大 {worst*1000:.0f}ms，超限 {len(over)} 个 {over[:3]}", "≤ 200ms"),
     ]
 
-    # 关键词动画相对发音的设计偏移（由 sync_timing.py 保证：提前 120ms 入场）
-    results.append(check("关键词入场提前量在 0~150ms", True, "120ms（构造保证）", "0~150ms"))
-
     # 章节 clip 窗口 == alignment 章节窗口
     index = (PROJECT / "index.html").read_text(encoding="utf-8")
     mismatch = []
@@ -263,6 +386,27 @@ def main() -> None:
         if abs(float(m.group(1)) - chapter["start"]) > 0.005 or abs(float(m.group(2)) - chapter["duration"]) > 0.005:
             mismatch.append((key, m.group(1), m.group(2)))
     results.append(check("章节 clip 窗口 == 旁白章节窗口", not mismatch, f"{len(mismatch)} 处不一致", "0"))
+
+    # ---------------- D2. manual-but-blocking audit artifacts ----------------
+    ledger_ok, ledger_measured = pronunciation_ledger_pass(WORK / "PRONUNCIATION_LEDGER.json")
+    pronunciation_ok, pronunciation_measured = pronunciation_qa_pass(
+        WORK / "PRONUNCIATION_QA.json"
+    )
+    results += [
+        check("全局发音台账完整且全部 verified", ledger_ok, ledger_measured,
+              "非空 JSON；字段完整；全部 verified=true"),
+        check("逐词发音专项验收", pronunciation_ok, pronunciation_measured,
+              "PRONUNCIATION_QA.json: status PASS；每个 occurrence 有证据"),
+    ]
+    if CFG.technical_explainer:
+        tech_ok, tech_measured = markdown_audit_pass(WORK / "TECHNICAL_EXPLAINER_AUDIT.md")
+        time_ok, time_measured = markdown_audit_pass(WORK / "TIMESTAMP_AUDIT.md")
+        results += [
+            check("技术内容一致性审计", tech_ok, tech_measured,
+                  "TECHNICAL_EXPLAINER_AUDIT.md 含独立行 status: PASS"),
+            check("指定时间点与内部遮挡审计", time_ok, time_measured,
+                  "TIMESTAMP_AUDIT.md 含独立行 status: PASS"),
+        ]
 
     # ---------------- E. contact sheet ----------------
     sheet = DELIVER / "contact_sheet.png"
@@ -281,8 +425,10 @@ def main() -> None:
              "-vf", f"scale=300:-1,drawtext=text='{label}':x=8:y=8:fontsize=15:"
                     f"fontcolor=white:box=1:boxcolor=black@0.75:boxborderw=4",
              str(tiles / f"t{i:03d}.png")])
+    sheet_rows = max(1, math.ceil(len(picks) / 3))
     run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-         "-i", str(tiles / "t%03d.png"), "-filter_complex", "tile=3x9", str(sheet)])
+         "-i", str(tiles / "t%03d.png"), "-filter_complex",
+         f"tile=3x{sheet_rows}", str(sheet)])
     results.append(check("contact sheet 已生成", sheet.exists(), str(sheet), "存在"))
 
     # 章节转场前后各抓一帧
@@ -300,9 +446,14 @@ def main() -> None:
                         f"fontcolor=white:box=1:boxcolor=black@0.75:boxborderw=4",
                  str(ttiles / f"t{n:03d}.png")])
             n += 1
-    run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-         "-i", str(ttiles / "t%03d.png"), "-filter_complex", "tile=4x4", str(tsheet)])
-    results.append(check("章节转场帧已抓取", tsheet.exists(), f"{n} 帧 -> {tsheet.name}", "16 帧"))
+    transition_cols = min(4, max(1, n))
+    transition_rows = max(1, math.ceil(n / transition_cols))
+    if n:
+        run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+             "-i", str(ttiles / "t%03d.png"), "-filter_complex",
+             f"tile={transition_cols}x{transition_rows}", str(tsheet)])
+    results.append(check("章节转场帧已抓取", n == 0 or tsheet.exists(),
+                         f"{n} 帧 -> {tsheet.name if n else 'single chapter'}", f"{n} 帧"))
 
     payload = {
         "label": args.label,
